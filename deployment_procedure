@@ -1,0 +1,420 @@
+# PostHog Self-Hosted Deployment Guide for DriveX
+
+**Domain:** `posthog.drivex.dev`  
+**Server:** AWS EC2 (Ubuntu 24.04)  
+**Date:** November 24, 2025
+
+---
+
+## Overview
+
+This document details the complete process of deploying PostHog on an EC2 instance with SSL/TLS enabled via Let's Encrypt, accessible at `https://posthog.drivex.dev`.
+
+---
+
+## Initial Problem
+
+PostHog was running locally on the EC2 instance but was inaccessible from the external domain `posthog.drivex.dev`. The browser showed:
+
+- **Error:** `SSL_ERROR_INTERNAL_ERROR_ALERT`
+- **Cause:** PostHog was configured for `localhost` instead of the actual domain
+
+---
+
+## Issues Fixed
+
+### 1. Domain Configuration in `.env`
+
+**Problem:** The `.env` file was configured for localhost.
+
+**Original Configuration:**
+```env
+DOMAIN=localhost
+CADDY_HOST="localhost, http://, https://"
+```
+
+**Fixed Configuration:**
+```env
+POSTHOG_SECRET=<your-secret>
+ENCRYPTION_SALT_KEYS=<your-salt>
+DOMAIN=posthog.drivex.dev
+EXTERNAL_URL=https://posthog.drivex.dev
+POSTHOG_APP_TAG=latest
+REGISTRY_URL=posthog/posthog
+TLS_BLOCK=
+```
+
+**Location:** `~/posthog/.env`
+
+---
+
+### 2. Docker Port Binding Conflict (Port 8333)
+
+**Problem:** SeaweedFS container failed to start due to port 8333 being in use.
+
+**Error:**
+```
+Error response from daemon: failed to bind host port 127.0.0.1:8333/tcp: address already in use
+```
+
+**Solution:** Complete Docker cleanup and restart.
+
+```bash
+# Stop all containers
+sudo docker compose -f docker-compose.hobby.yml down -v --remove-orphans
+
+# Clean up all Docker resources
+sudo docker system prune -af --volumes
+
+# Restart Docker daemon
+sudo systemctl restart docker
+
+# Wait and restart
+sleep 10
+sudo docker compose -f docker-compose.hobby.yml up -d
+```
+
+---
+
+### 3. Corrupted Git Clone - Files as Directories
+
+**Problem:** Git checkout was corrupted - `config.xml` and other files were directories instead of files.
+
+**Symptom:**
+```
+drwxr-xr-x 2 root root 4096 Nov 24 07:25 config.xml   # Should be a file, not directory
+```
+
+**Solution:** Fresh clone of the repository.
+
+```bash
+cd ~
+sudo rm -rf ~/posthog
+git clone https://github.com/PostHog/posthog.git
+cd posthog
+```
+
+---
+
+### 4. Incorrect Volume Mount Paths in docker-compose
+
+**Problem:** The `docker-compose.hobby.yml` had incorrect paths pointing to `./posthog/docker/` instead of `./docker/`.
+
+**Error:**
+```
+error mounting "/home/ubuntu/posthog/posthog/docker/clickhouse/config.xml"
+```
+
+**Solution:** Fix paths using sed.
+
+```bash
+cd ~/posthog
+sed -i 's|./posthog/docker/|./docker/|g' docker-compose.hobby.yml
+sed -i 's|./posthog/posthog/|./posthog/|g' docker-compose.hobby.yml
+```
+
+**Verification:**
+```bash
+grep -n "clickhouse" ~/posthog/docker-compose.hobby.yml | head -10
+# Should show: ./docker/clickhouse/...
+```
+
+---
+
+### 5. Missing Compose Directory Scripts
+
+**Problem:** The `compose/` directory was empty, causing web container to fail with:
+```
+/usr/local/bin/docker-entrypoint.sh: 101: exec: /compose/start: not found
+```
+
+**Solution:** Copy required scripts from `bin/` to `compose/`.
+
+```bash
+sudo mkdir -p ~/posthog/compose
+sudo cp ~/posthog/bin/start ~/posthog/compose/
+sudo cp ~/posthog/bin/start-backend ~/posthog/compose/
+sudo cp ~/posthog/bin/start-worker ~/posthog/compose/
+sudo cp ~/posthog/bin/start-frontend ~/posthog/compose/
+sudo chmod +x ~/posthog/compose/*
+sudo chown -R ubuntu:ubuntu ~/posthog/compose
+```
+
+---
+
+### 6. Caddy Not Using Domain for SSL
+
+**Problem:** Caddy was configured to listen on `localhost:8000` instead of the domain, preventing SSL certificate provisioning.
+
+**Original Caddyfile (generated dynamically):**
+```
+http://localhost:8000 {
+    ...
+}
+```
+
+**Solution:** Create custom Caddyfile and override proxy service.
+
+**Step 1:** Create Caddyfile with domain:
+
+```bash
+mkdir -p ~/posthog/docker/proxy
+cat > ~/posthog/docker/proxy/Caddyfile << 'EOF'
+posthog.drivex.dev {
+    @replay-capture {
+        path /s
+        path /s/
+        path /s/*
+    }
+
+    @capture {
+        path /e
+        path /e/
+        path /e/*
+        path /i/v0
+        path /i/v0/
+        path /i/v0/*
+        path /batch
+        path /batch/
+        path /batch/*
+        path /capture
+        path /capture/
+        path /capture/*
+    }
+
+    @flags {
+        path /flags
+        path /flags/
+        path /flags/*
+    }
+
+    @webhooks {
+        path /public/webhooks
+        path /public/webhooks/
+        path /public/webhooks/*
+        path /public/m/
+        path /public/m/*
+    }
+
+    handle @capture {
+        reverse_proxy capture:3000
+    }
+
+    handle @replay-capture {
+        reverse_proxy replay-capture:3000
+    }
+
+    handle @flags {
+        reverse_proxy feature-flags:3001
+    }
+
+    handle @webhooks {
+        reverse_proxy plugins:6738
+    }
+
+    handle {
+        reverse_proxy web:8000
+    }
+}
+EOF
+```
+
+**Step 2:** Modify proxy service in `docker-compose.hobby.yml`:
+
+Replace the proxy section (around line 156) with:
+
+```yaml
+    proxy:
+        image: caddy:2
+        restart: unless-stopped
+        ports:
+            - '80:80'
+            - '443:443'
+        volumes:
+            - caddy-data:/data
+            - caddy-config:/config
+            - ./docker/proxy/Caddyfile:/etc/caddy/Caddyfile:ro
+        command: caddy run --config /etc/caddy/Caddyfile
+        depends_on:
+            - web
+```
+
+**Verification:** Check SSL certificate provisioning in logs:
+```bash
+sudo docker compose -f docker-compose.hobby.yml logs proxy --tail=30
+```
+
+Should show:
+```
+"certificate obtained successfully", "identifier": "posthog.drivex.dev"
+```
+
+---
+
+### 7. GeoIP Download Blocking Web Startup
+
+**Problem:** Web container stuck in infinite retry loop trying to download GeoIP database.
+
+**Error:**
+```
+./bin/download-mmdb: line 22: brotli: command not found
+curl: (23) Failure writing output to destination
+Download failed after retries
+```
+
+**Solution:** Modify the start script to skip GeoIP download and use gunicorn.
+
+```bash
+cat > ~/posthog/compose/start << 'EOF'
+#!/bin/bash
+set -e
+
+export DISABLE_MMDB=1
+export SKIP_MMDB_DOWNLOAD=1
+
+echo "🚀 Starting PostHog..."
+
+# Run migrations
+python manage.py migrate --noinput 2>/dev/null || true
+
+# Start with gunicorn
+exec gunicorn posthog.wsgi:application --bind 0.0.0.0:8000 --workers 2 --timeout 120
+EOF
+
+chmod +x ~/posthog/compose/start
+```
+
+---
+
+## Final Directory Structure
+
+```
+~/posthog/
+├── .env                              # Environment configuration
+├── docker-compose.hobby.yml          # Modified compose file
+├── compose/
+│   ├── start                         # Modified start script
+│   ├── start-backend
+│   ├── start-worker
+│   └── start-frontend
+├── docker/
+│   ├── clickhouse/
+│   │   ├── config.xml               # ClickHouse config
+│   │   ├── users.xml
+│   │   └── ...
+│   └── proxy/
+│       └── Caddyfile                # Custom Caddy config with domain
+└── ...
+```
+
+---
+
+## Final `.env` File
+
+```env
+POSTHOG_SECRET=<generated-secret>
+ENCRYPTION_SALT_KEYS=<generated-salt>
+DOMAIN=posthog.drivex.dev
+EXTERNAL_URL=https://posthog.drivex.dev
+POSTHOG_APP_TAG=latest
+REGISTRY_URL=posthog/posthog
+TLS_BLOCK=
+```
+
+---
+
+## Useful Commands
+
+### Start PostHog
+```bash
+cd ~/posthog
+sudo docker compose -f docker-compose.hobby.yml up -d
+```
+
+### Stop PostHog
+```bash
+cd ~/posthog
+sudo docker compose -f docker-compose.hobby.yml down
+```
+
+### View Logs
+```bash
+# All services
+sudo docker compose -f docker-compose.hobby.yml logs -f
+
+# Specific service
+sudo docker compose -f docker-compose.hobby.yml logs web --tail=50
+sudo docker compose -f docker-compose.hobby.yml logs proxy --tail=50
+```
+
+### Check Status
+```bash
+sudo docker compose -f docker-compose.hobby.yml ps
+```
+
+### Restart a Service
+```bash
+sudo docker compose -f docker-compose.hobby.yml restart web
+sudo docker compose -f docker-compose.hobby.yml restart proxy
+```
+
+### Full Reset (if needed)
+```bash
+cd ~/posthog
+sudo docker compose -f docker-compose.hobby.yml down -v --remove-orphans
+sudo docker system prune -af --volumes
+sudo systemctl restart docker
+sleep 10
+sudo docker compose -f docker-compose.hobby.yml up -d
+```
+
+---
+
+## AWS Security Group Requirements
+
+Ensure your EC2 security group allows:
+
+| Port | Protocol | Source    | Purpose                        |
+|------|----------|-----------|--------------------------------|
+| 80   | TCP      | 0.0.0.0/0 | HTTP (Let's Encrypt challenge) |
+| 443  | TCP      | 0.0.0.0/0 | HTTPS (PostHog access)         |
+| 22   | TCP      | Your IP   | SSH access                     |
+
+---
+
+## Route53 DNS Configuration
+
+- **Record Type:** A
+- **Name:** posthog.drivex.dev
+- **Value:** EC2 Public IP Address
+- **TTL:** 300
+
+---
+
+## Verification Checklist
+
+- [ ] `https://posthog.drivex.dev` loads PostHog UI
+- [ ] SSL certificate is valid (padlock icon in browser)
+- [ ] All core containers running: `web`, `proxy`, `clickhouse`, `kafka`, `redis`, `db`
+- [ ] Can create admin account and log in
+
+---
+
+## Known Issues (Non-Critical)
+
+Some services may show "Restarting" status initially:
+- `feature-flags` - Stabilizes after web is fully up
+- `property-defs-rs` - Stabilizes after ClickHouse is ready
+- `temporal-django-worker` - Stabilizes after migrations complete
+
+These typically resolve within 5-10 minutes of initial startup.
+
+---
+
+## Contact
+
+For PostHog documentation: https://posthog.com/docs/self-host
+
+---
+
+*Document created: November 24, 2025*
