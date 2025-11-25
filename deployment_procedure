@@ -417,4 +417,392 @@ For PostHog documentation: https://posthog.com/docs/self-host
 
 ---
 
-*Document created: November 24, 2025*
+*Document created: November 24, 2025* 
+
+# PostHog Troubleshooting - ClickHouse Tables Missing
+
+**Issue Date:** November 25, 2025  
+**Instance:** `posthog.drivex.dev`  
+**Server:** AWS EC2 (Ubuntu 24.04)
+
+---
+
+## Problem Description
+
+After successful deployment, PostHog UI was accessible but non-functional:
+- Dashboard showed "A server error occurred" on all insights
+- All analytics widgets displayed server errors
+- Plugin configuration page showed: "Load hog function plugins destinations failed: A server error occurred"
+
+### Symptoms in Screenshots
+- Daily Active Users (DAUs) widget: "A server error occurred"
+- Weekly Active Users (WAUs) widget: "A server error occurred"
+- Growth Accounting widget: "A server error occurred"
+- Retention widget: "A server error occurred"
+- Error banner: "Load hog function plugins destinations failed: A server error occurred"
+
+---
+
+## Root Cause Analysis
+
+### Investigation Steps
+
+**1. Check Container Status:**
+```bash
+cd ~/posthog
+sudo docker compose -f docker-compose.hobby.yml ps
+```
+
+**Findings:**
+- Most containers running normally
+- `feature-flags` container: **Restarting (101)** - continuously failing
+- `temporal-django-worker` container: **Restarting (127)** - continuously failing
+- `worker` container: Just restarted
+
+**2. Check Web Service Logs:**
+```bash
+sudo docker compose -f docker-compose.hobby.yml logs web --tail=100
+```
+
+**Critical Error Found:**
+```
+clickhouse_driver.errors.ServerException: Code: 60.
+DB::Exception: Table posthog.app_metrics does not exist.
+```
+
+**3. Root Cause Identified:**
+
+The ClickHouse database was running, but **PostHog's schema (tables) were never initialized**. The application was trying to query tables like:
+- `posthog.app_metrics`
+- `posthog.events`
+- `posthog.persons`
+- `posthog.sessions`
+
+But these tables didn't exist in the ClickHouse database.
+
+### Why This Happened
+
+When PostHog is deployed, it requires two migration steps:
+1. **PostgreSQL migrations** - for user accounts, projects, teams (completed automatically)
+2. **ClickHouse migrations** - for analytics data tables (was NOT run)
+
+The ClickHouse migrations must be explicitly triggered using:
+```bash
+python manage.py migrate_clickhouse
+```
+
+---
+
+## Solution
+
+### Step 1: Run ClickHouse Migrations
+
+```bash
+cd ~/posthog
+
+# Execute ClickHouse migrations inside the web container
+sudo docker compose -f docker-compose.hobby.yml exec web python manage.py migrate_clickhouse
+```
+
+**Expected Output:**
+```
+{'event': "\n                You indicated your instance is behind a proxy (IS_BEHIND_PROXY env var),\n                but you haven't configured any trusted proxies. See\n                https://posthog.com/docs/configuring-posthog/running-behind-proxy for details.\n            ", 'timestamp': '2025-11-25T06:01:14.868910Z', 'logger': 'posthog.settings.access', 'level': 'warning', 'pid': 584, 'tid': 139728410925952}
+2025-11-25T06:01:15.870543Z [warning  ] initialized clickhouse users: DEFAULT,API,APP [root] pid=584 tid=139728410925952
+...
+✅ Migration successful
+```
+
+**Note:** Warnings about proxy configuration and GeoIP database are non-critical and can be ignored.
+
+---
+
+### Step 2: Verify Tables Were Created
+
+```bash
+# List all tables in the posthog database
+sudo docker compose -f docker-compose.hobby.yml exec clickhouse clickhouse-client --query "SHOW TABLES FROM posthog"
+```
+
+**Expected Output (partial list):**
+```
+app_metrics
+events
+person
+person_distinct_id
+session_recording_events
+sessions
+groups
+cohortpeople
+plugin_log_entries
+...
+```
+
+---
+
+### Step 3: Restart Failing Services
+
+After tables are created, restart services that were stuck in restart loops:
+
+```bash
+cd ~/posthog
+
+# Restart the affected services
+sudo docker compose -f docker-compose.hobby.yml restart feature-flags
+sudo docker compose -f docker-compose.hobby.yml restart temporal-django-worker
+sudo docker compose -f docker-compose.hobby.yml restart worker
+sudo docker compose -f docker-compose.hobby.yml restart web
+
+# Wait for services to stabilize
+sleep 30
+```
+
+---
+
+### Step 4: Verify All Services Are Running
+
+```bash
+sudo docker compose -f docker-compose.hobby.yml ps
+```
+
+**Expected Output:**
+All services should show **"Up"** status (except brief restarts):
+```
+NAME                               STATUS
+posthog-web-1                      Up
+posthog-clickhouse-1               Up
+posthog-db-1                       Up (healthy)
+posthog-redis-1                    Up (healthy)
+posthog-kafka-1                    Up (healthy)
+posthog-plugins-1                  Up
+posthog-worker-1                   Up
+posthog-feature-flags-1            Up
+posthog-temporal-django-worker-1   Up
+...
+```
+
+---
+
+### Step 5: Test in Browser
+
+1. Navigate to `https://posthog.drivex.dev`
+2. Refresh the dashboard
+3. Verify insights load without errors:
+   - Daily Active Users (DAUs) should show graph or "No data" (not error)
+   - Weekly Active Users (WAUs) should show graph or "No data" (not error)
+   - Growth Accounting should display properly
+   - Retention widget should display properly
+4. Check plugin configuration page - should load without error banner
+
+---
+
+## Alternative Solution (If Migration Command Fails)
+
+If the `migrate_clickhouse` command doesn't exist or fails, use the full reset approach:
+
+```bash
+cd ~/posthog
+
+# Stop all services
+sudo docker compose -f docker-compose.hobby.yml down
+
+# Remove ClickHouse data (forces reinitialization)
+sudo rm -rf ~/posthog/data/clickhouse
+
+# Start ClickHouse first
+sudo docker compose -f docker-compose.hobby.yml up -d clickhouse
+sleep 30
+
+# Start web service (will trigger schema initialization)
+sudo docker compose -f docker-compose.hobby.yml up -d web
+sleep 60
+
+# Check if tables were created
+sudo docker compose -f docker-compose.hobby.yml exec clickhouse clickhouse-client --query "SHOW TABLES FROM posthog"
+
+# Start all remaining services
+sudo docker compose -f docker-compose.hobby.yml up -d
+```
+
+---
+
+## Verification Checklist
+
+After applying the fix, verify:
+
+- [ ] `migrate_clickhouse` command completed successfully
+- [ ] ClickHouse tables exist (40+ tables should be present)
+- [ ] All containers show "Up" status
+- [ ] No containers stuck in restart loops
+- [ ] Dashboard insights load without "server error" messages
+- [ ] Can create new insights
+- [ ] Plugin configuration page loads without errors
+- [ ] No ClickHouse table errors in web service logs
+
+---
+
+## Monitoring for Errors
+
+To monitor for any remaining issues:
+
+```bash
+# Watch web service logs in real-time
+sudo docker compose -f docker-compose.hobby.yml logs web -f --tail=50
+
+# Watch ClickHouse logs
+sudo docker compose -f docker-compose.hobby.yml logs clickhouse -f --tail=50
+
+# Watch all logs
+sudo docker compose -f docker-compose.hobby.yml logs -f
+```
+
+**What to Look For:**
+- ❌ **Bad:** `Table posthog.XXX does not exist`
+- ❌ **Bad:** `Code: 60. DB::Exception`
+- ✅ **Good:** Normal query logs without table errors
+- ✅ **Good:** Successful API requests in web logs
+
+---
+
+## Understanding the Error
+
+### What Happened Behind the Scenes
+
+1. **PostgreSQL (db container):** Stores user accounts, projects, teams, configurations
+   - Migrations ran automatically ✅
+   
+2. **ClickHouse (clickhouse container):** Stores analytics events, persons, sessions
+   - Container started ✅
+   - Database created ✅
+   - **Tables NOT created** ❌
+   
+3. **Web Service:** Tried to query ClickHouse tables
+   - PostgreSQL queries worked fine ✅
+   - ClickHouse queries failed (tables missing) ❌
+
+### Why Manual Migration Was Needed
+
+PostHog's docker-compose setup runs PostgreSQL migrations automatically via the `start` script, but ClickHouse migrations must be triggered separately because:
+- ClickHouse schema is more complex
+- Analytics tables require specific partitioning
+- Migration timing depends on ClickHouse being fully ready
+
+---
+
+## Prevention for Future Deployments
+
+### Fresh Installation Checklist
+
+When deploying PostHog from scratch:
+
+1. Start all services:
+   ```bash
+   sudo docker compose -f docker-compose.hobby.yml up -d
+   ```
+
+2. Wait for all services to be ready (2-3 minutes):
+   ```bash
+   sleep 180
+   ```
+
+3. **Always run ClickHouse migrations:**
+   ```bash
+   sudo docker compose -f docker-compose.hobby.yml exec web python manage.py migrate_clickhouse
+   ```
+
+4. Verify tables exist:
+   ```bash
+   sudo docker compose -f docker-compose.hobby.yml exec clickhouse clickhouse-client --query "SHOW TABLES FROM posthog" | wc -l
+   ```
+   Should return 40+ tables
+
+5. Restart services if needed:
+   ```bash
+   sudo docker compose -f docker-compose.hobby.yml restart feature-flags temporal-django-worker worker
+   ```
+
+---
+
+## Related Issues
+
+### PostgreSQL Errors (Non-Critical)
+
+The PostgreSQL logs showed duplicate constraint errors:
+```
+ERROR: ON CONFLICT DO UPDATE command cannot affect row a second time
+```
+
+**Analysis:** This is a known issue with concurrent property definition updates. It's non-critical and doesn't affect functionality. The errors appear when multiple workers try to update the same property definitions simultaneously.
+
+**Impact:** None - these are handled gracefully by PostHog's code.
+
+---
+
+## Additional Commands Reference
+
+### Check ClickHouse Database Size
+```bash
+sudo docker compose -f docker-compose.hobby.yml exec clickhouse clickhouse-client --query "
+SELECT 
+    database,
+    formatReadableSize(sum(bytes)) AS size
+FROM system.parts
+WHERE database = 'posthog'
+GROUP BY database"
+```
+
+### Check Table Row Counts
+```bash
+sudo docker compose -f docker-compose.hobby.yml exec clickhouse clickhouse-client --query "
+SELECT 
+    table,
+    formatReadableQuantity(total_rows) AS rows
+FROM system.tables
+WHERE database = 'posthog'
+ORDER BY total_rows DESC
+LIMIT 10"
+```
+
+### Test ClickHouse Connectivity
+```bash
+sudo docker compose -f docker-compose.hobby.yml exec clickhouse clickhouse-client --query "SELECT version()"
+```
+
+### Manual Table Creation (Last Resort)
+
+If migrations fail completely, you can manually create tables by running the SQL scripts:
+```bash
+# Access ClickHouse client
+sudo docker compose -f docker-compose.hobby.yml exec clickhouse clickhouse-client
+
+# Inside the client, check for schema files
+# Note: This is a last resort and should generally not be needed
+```
+
+---
+
+## Summary
+
+**Problem:** PostHog UI accessible but all analytics features showing "A server error occurred"
+
+**Root Cause:** ClickHouse database tables were not initialized during deployment
+
+**Solution:** Run `python manage.py migrate_clickhouse` inside the web container
+
+**Result:** All tables created, services stabilized, analytics working
+
+**Time to Fix:** ~2-3 minutes
+
+**Prevention:** Always run ClickHouse migrations after initial deployment
+
+---
+
+## References
+
+- PostHog Self-Hosted Docs: https://posthog.com/docs/self-host
+- ClickHouse Documentation: https://clickhouse.com/docs
+- PostHog GitHub Issues: https://github.com/PostHog/posthog/issues
+
+---
+
+*Document created: November 25, 2025*  
+*Issue resolved: November 25, 2025*
