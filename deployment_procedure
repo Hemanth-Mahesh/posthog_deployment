@@ -805,4 +805,62 @@ sudo docker compose -f docker-compose.hobby.yml exec clickhouse clickhouse-clien
 ---
 
 *Document created: November 25, 2025*  
-*Issue resolved: November 25, 2025*
+*Issue resolved: November 25, 2025* 
+
+///////////////////////////////////////// commands to check Shai-Hulud Attack Detection Script on posthog ///////////////////////////////////////////////////
+
+echo "=========================================="
+echo "Shai-Hulud Attack Detection Script"
+echo "=========================================="
+
+echo ""
+echo "1. Checking for malicious files..."
+MALICIOUS=$(find /home -name "setup_bun.js" -o -name "bun_environment.js" -o -name "cloud.json" -o -name "contents.json" -o -name "environment.json" -o -name "truffleSecrets.json" 2>/dev/null | grep -v ".git")
+if [ -z "$MALICIOUS" ]; then
+    echo "   ✅ No malicious files found"
+else
+    echo "   ❌ WARNING: Malicious files detected:"
+    echo "$MALICIOUS"
+fi
+
+echo ""
+echo "2. Checking for node_modules..."
+NODEMOD=$(find /home/ubuntu -type d -name "node_modules" 2>/dev/null)
+if [ -z "$NODEMOD" ]; then
+    echo "   ✅ No node_modules directories (no npm packages installed)"
+else
+    echo "   ⚠️  node_modules found at:"
+    echo "$NODEMOD"
+fi
+
+echo ""
+echo "3. Checking npm logs for suspicious activity..."
+if [ -d ~/.npm/_logs ]; then
+    SUSPICIOUS=$(grep -r "shai\|hulud\|preinstall" ~/.npm/_logs 2>/dev/null)
+    if [ -z "$SUSPICIOUS" ]; then
+        echo "   ✅ No suspicious entries in npm logs"
+    else
+        echo "   ❌ WARNING: Suspicious npm log entries:"
+        echo "$SUSPICIOUS"
+    fi
+else
+    echo "   ✅ No npm logs directory (npm not used)"
+fi
+
+echo ""
+echo "4. Checking GitHub Actions workflows..."
+WORKFLOWS=$(find /home -name "discussion.yaml" -path "*/.github/workflows/*" 2>/dev/null)
+if [ -z "$WORKFLOWS" ]; then
+    echo "   ✅ No suspicious GitHub workflow files"
+else
+    echo "   ⚠️  Found discussion.yaml workflow (could be malicious):"
+    echo "$WORKFLOWS"
+fi
+
+echo ""
+echo "=========================================="
+echo "Scan complete!"
+echo "=========================================="
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
